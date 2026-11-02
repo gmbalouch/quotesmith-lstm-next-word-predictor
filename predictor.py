@@ -1,4 +1,4 @@
-"""Next-word prediction engine (no Streamlit code here, so it is easy to test)."""
+"""Next-word prediction engine (pure NumPy inference, no TensorFlow needed at runtime)."""
 from __future__ import annotations
 
 import json
@@ -20,17 +20,17 @@ class Encoded:
 
 class NextWordPredictor:
     def __init__(self, model_dir: Path = MODEL_DIR):
-        # Imported here so importing this module stays cheap.
-        from keras.models import load_model
-
         with open(model_dir / "vocab.json", encoding="utf-8") as f:
             vocab = json.load(f)
         self.word_index: dict[str, int] = vocab["word_index"]
         self.num_words: int = vocab["num_words"]
         self.max_len: int = vocab["max_len"]
         self.index_word = {i: w for w, i in self.word_index.items()}
-        self.model = load_model(model_dir / "lstm_model.keras", compile=False)
-        self.vocab_size = self.model.output_shape[-1]
+        w = np.load(model_dir / "weights.npz")
+        self.E, self.K, self.R, self.b = w["embedding"], w["kernel"], w["recurrent"], w["bias"]
+        self.Wd, self.bd = w["dense_w"], w["dense_b"]
+        self.units = self.R.shape[0]
+        self.vocab_size = self.Wd.shape[1]
 
     # ---------- text -> ids ----------
     @staticmethod
@@ -56,8 +56,32 @@ class NextWordPredictor:
         return arr
 
     # ---------- prediction ----------
+    @staticmethod
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def _forward(self, ids: list[int]) -> np.ndarray:
+        """Embedding -> LSTM (Keras gate order i,f,c,o) -> Dense softmax, in plain NumPy."""
+        x = self.E[self._pad(ids)[0]]            # (max_len, emb_dim)
+        xw = x @ self.K + self.b                 # input projections for all steps at once
+        u = self.units
+        h = np.zeros(u, dtype="float32")
+        c = np.zeros(u, dtype="float32")
+        for t in range(xw.shape[0]):
+            z = xw[t] + h @ self.R
+            i = self._sigmoid(z[:u])
+            f = self._sigmoid(z[u:2 * u])
+            g = np.tanh(z[2 * u:3 * u])
+            o = self._sigmoid(z[3 * u:])
+            c = f * c + i * g
+            h = o * np.tanh(c)
+        logits = (h @ self.Wd + self.bd).astype("float64")
+        logits -= logits.max()
+        e = np.exp(logits)
+        return e / e.sum()
+
     def probabilities(self, ids: list[int]) -> np.ndarray:
-        p = self.model.predict(self._pad(ids), verbose=0)[0].astype("float64")
+        p = self._forward(ids).astype("float64")
         p[0] = 0.0  # index 0 is padding, never a real word
         return p / p.sum()
 
